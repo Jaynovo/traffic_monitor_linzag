@@ -1,0 +1,268 @@
+# MQTT Contract — Transit Monitor
+
+**Contract version:** 1
+**Status:** draft
+**Last change:** 2026-09-17
+
+This document is the interface between the publisher (`Traffic_Monitor`, Java, running on the EliteDesk) and the display firmware (M5Stack Core Basic). It is authoritative: neither side may assume anything about the other beyond what is written here.
+
+---
+
+## 1. Actors
+
+| Actor | Role |
+|---|---|
+| **Publisher** | Polls the Linz AG EFA endpoint, normalises, publishes. Sole writer on all topics below. |
+| **Broker** | Mosquitto, LXC on the Proxmox host. Plain TCP on the LAN, port 1883, no TLS. |
+| **Display** | M5Stack Core Basic. Subscribe-only. Never publishes in contract version 1. |
+
+---
+
+## 2. Conventions
+
+- **Encoding:** UTF-8. Payloads are JSON objects, no leading/trailing whitespace.
+- **Time:** all timestamps are integer **epoch seconds, UTC**. No local time, no ISO strings, no timezone fields.
+- **Versioning:** every payload carries `v` (integer).
+    - Adding an optional key **does not** bump `v`.
+    - Removing a key, renaming a key, or changing a key's type **does** bump `v`.
+    - Consumers **must** ignore unknown keys.
+    - Consumers **must not** render a payload whose `v` they do not know.
+- **Omission over null:** optional fields are left out entirely rather than sent as `null`. The one exception is `up_err`, which is explicitly nullable so that "checked, no error" is distinguishable from "field missing".
+- **Snapshots, not deltas:** every departures message is a complete replacement for the previous one. Duplicate delivery is therefore harmless.
+
+---
+
+## 3. Topics
+
+| Topic | Retain | QoS | Direction |
+|---|---|---|---|
+| `transit/departures/<stopId>` | yes | 0 | publisher → display |
+| `transit/config/stops` | yes | 1 | publisher → display |
+| `transit/publisher/status` | yes | 1 | publisher → display (also LWT) |
+
+Rationale:
+
+- **Retain everywhere** so the display has a complete picture within milliseconds of connecting. No request/response handshake, no blank first screen.
+- **QoS 0 on departures** — each message fully supersedes the previous one within one interval; a lost message costs at most one cycle and adds no PUBACK bookkeeping to the ESP32 loop.
+- **QoS 1 on config and status** — rare messages where a silent loss stays wrong for a long time.
+
+`<stopId>` is the Linz AG numeric stop ID, used verbatim as the topic suffix.
+
+The display subscribes to `transit/departures/+`, `transit/config/stops`, `transit/publisher/status`.
+
+---
+
+## 4. `transit/departures/<stopId>`
+
+One snapshot per stop, republished every interval.
+
+### Schema
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `v` | int | yes | contract version |
+| `gen` | int | yes | epoch seconds — when the publisher serialised this message |
+| `stop` | string | yes | stop ID, identical to the topic suffix |
+| `dep` | array | yes | departure rows, ascending by effective departure time, **max 8** |
+
+Each element of `dep`:
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `l` | string | yes | line label as displayed — `"1"`, `"12"`, `"S3"` |
+| `d` | string | yes | destination, UTF-8, capped at **32 characters** |
+| `p` | int | yes | planned departure, epoch seconds |
+| `r` | int | no | realtime departure, epoch seconds. **Omitted when no realtime data exists.** |
+| `c` | int | no | `1` if cancelled. Omitted when false. |
+
+Effective departure time is `r` if present, otherwise `p`.
+
+### Example
+
+```json
+{
+  "v": 1,
+  "gen": 1758124800,
+  "stop": "60500445",
+  "dep": [
+    {"l": "1",  "d": "Auwiesen",     "p": 1758124980, "r": 1758125040},
+    {"l": "12", "d": "Hauptbahnhof", "p": 1758125100},
+    {"l": "2",  "d": "Solarcity",    "p": 1758125160, "r": 1758125160, "c": 1}
+  ]
+}
+```
+
+Typical size: 400–700 bytes.
+
+### Design notes
+
+**No countdown minutes, no `delay` field.** A server-side `"4 Min"` is false one second after it is sent, and `r - p` is derivable. The display computes `remaining = effective - gen` once on receipt, records `millis()`, and counts down from the monotonic delta. Consequence: **the display never needs wall-clock time and therefore never needs NTP.** One less boot-order dependency.
+
+**No `src` / `rt` flag.** The presence of `r` *is* the realtime flag, including the zero-delay case where `r == p`. A row without `r` is scheduled-only and should be rendered distinctly (greyed, or asterisked).
+
+**8 rows although ~5 fit.** Rows expire between messages; the board needs spares at second 55 of the interval.
+
+**Truncation is the display's job.** The publisher caps `d` at 32 characters to bound payload size, but does not truncate to screen width, and does not fold umlauts to ASCII. Font handling is a firmware concern and must not leak into the contract.
+
+---
+
+## 5. `transit/config/stops`
+
+Ordered list of the stops the publisher is serving. Republished on change and at publisher startup.
+
+### Schema
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `v` | int | yes | contract version |
+| `stops` | array | yes | ordered; array order **is** the button cycle order |
+
+Each element:
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `id` | string | yes | stop ID; matches a `transit/departures/<id>` topic |
+| `label` | string | yes | display name, UTF-8, capped at 20 characters |
+
+### Example
+
+```json
+{
+  "v": 1,
+  "stops": [
+    {"id": "60500445", "label": "Hauptplatz"},
+    {"id": "60500446", "label": "Taubenmarkt"},
+    {"id": "60501234", "label": "Rudolfstraße"}
+  ]
+}
+```
+
+Adding or removing a stop is a publisher-side configuration change. It is **never** a reflash.
+
+The display caches departures for every stop it has received and switches between them from RAM on button press — no network round trip, no perceptible latency.
+
+---
+
+## 6. `transit/publisher/status`
+
+Publisher liveness and upstream health. Republished every interval, alongside the departures messages.
+
+### Schema
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `v` | int | yes | contract version |
+| `gen` | int | yes | epoch seconds — when this status was serialised |
+| `ok` | bool | yes | publisher process is alive and publishing |
+| `int` | int | yes | nominal publish interval in **seconds** |
+| `up_ok` | int | yes | epoch seconds of the last **successful** upstream fetch |
+| `up_err` | string\|null | yes | reason for the most recent upstream failure, `null` if the last attempt succeeded |
+| `stops` | int | no | number of stops currently served |
+
+### Example
+
+```json
+{
+  "v": 1,
+  "gen": 1758124800,
+  "ok": true,
+  "int": 60,
+  "up_ok": 1758124800,
+  "up_err": null,
+  "stops": 3
+}
+```
+
+### Last Will and Testament
+
+Registered on connect, on this same topic, retained:
+
+```json
+{"v": 1, "ok": false, "up_err": "lwt"}
+```
+
+The will payload is static and therefore carries no `gen`. The display must treat an `ok: false` status as "publisher down, age unknown" and fall back to its own connection-state timing.
+
+### `up_err` vocabulary
+
+| Value | Meaning |
+|---|---|
+| `null` | last upstream attempt succeeded |
+| `"timeout"` | upstream did not respond in time |
+| `"http_<code>"` | upstream returned a non-2xx status, e.g. `"http_502"` |
+| `"parse"` | response received but could not be parsed |
+| `"empty"` | response parsed but contained no usable departures |
+| `"lwt"` | publisher connection lost (set by the broker, not the publisher) |
+
+### Why `int` is published
+
+The display derives its staleness thresholds from `int` rather than hardcoding seconds. Changing the poll cadence server-side moves the device's notion of "stale" with it, without a reflash.
+
+---
+
+## 7. Display state derivation
+
+Two **orthogonal** axes. They must not be collapsed into a single mode enum — doing so loses the distinction between "my WiFi died" and "Linz AG is failing", which need different text on screen.
+
+### Axis A — link state
+
+| State | Condition | Screen |
+|---|---|---|
+| `OFFLINE` | no WiFi association | "Kein WLAN" |
+| `NO_BROKER` | WiFi up, MQTT socket down | "Kein Broker" |
+| `ONLINE` | MQTT connected | normal |
+
+### Axis B — data freshness
+
+Let `age = now - gen` of the stop currently displayed, measured from the monotonic `millis()` delta since receipt.
+
+| State | Enter when | Return when | Rendering |
+|---|---|---|---|
+| `FRESH` | — | `age < 1.5 × int` | full brightness |
+| `AGING` | `age > 2.5 × int` | `age < 4 × int` (from STALE) | timestamp shown in header |
+| `STALE` | `age > 5 × int` | — | dimmed rows, "Daten veraltet" |
+
+Asymmetric enter/exit thresholds are deliberate: they prevent mode flapping at a boundary.
+
+### Upstream state
+
+Independent of both axes. If `ok == true` but `up_err != null`, the publisher is alive and the fault is at Linz AG — show "Keine Echtzeitdaten", keep rendering the cached rows, and do **not** display a connection error.
+
+### Retained-message consequence
+
+If the publisher dies, retained departures persist on the broker indefinitely. A display rebooting hours later will therefore come up with an old snapshot. This is intended: it boots into *stale-but-labelled* rather than blank, which is the honest-degradation behaviour. The `gen` field is what makes it honest.
+
+---
+
+## 8. Publisher obligations
+
+1. Maintain a **persistent** MQTT connection. A cron-scheduled publisher disconnects cleanly each run, so the LWT never fires and the retained status keeps claiming `ok: true` after the job stops being scheduled. Run as a systemd unit with an internal scheduler.
+2. Publish `transit/config/stops` and `transit/publisher/status` on startup, before the first departures message.
+3. Publish a status message every interval regardless of upstream success.
+4. On upstream failure, **do not** republish departures. Let the existing retained message age; the display's freshness logic handles the rest. Publishing an empty `dep` array to signal an error is forbidden — an empty array means "no departures from this stop", which is a legitimate late-night state.
+5. Sort `dep` ascending by effective departure time and drop rows already in the past.
+6. Never publish a departures topic for a stop absent from `transit/config/stops`.
+
+## 9. Display obligations
+
+1. Subscribe before doing anything else; render from retained messages.
+2. Ignore unknown keys. Refuse to render an unknown `v` and show a "Firmware veraltet" screen instead.
+3. Compute countdowns from the monotonic delta since receipt, never from a wall clock.
+4. Never publish. No device→server topics exist in version 1.
+
+---
+
+## 10. Out of scope for version 1
+
+- **Device→server topics.** A `transit/cmd/refresh` on button C would buy roughly 30 seconds at the cost of a subscribe path on the publisher and a new failure mode. Add when the interval actually becomes annoying.
+- **TLS and authentication.** LAN hop only, single trusted segment.
+- **Multiple displays.** Nothing in this contract prevents them — every message is broadcast and retained — but no per-device state exists.
+- **Static GTFS fallback.** A scheduled-timetable tier below `STALE` belongs in firmware and in the degradation layer, not in the MQTT contract.
+
+---
+
+## 11. Change log
+
+| Version | Date | Change |
+|---|---|---|
+| 1 | 2026-09-17 | Initial contract. |
